@@ -1,34 +1,11 @@
 """
-Bước 10: Hệ thống Cơ sở Dữ liệu Vân tay (Fingerprint Database System)
+Bước 10: Cơ sở Dữ liệu & Tìm kiếm Faiss IVF
 =========================================================================
-Mục tiêu: Xây dựng hệ thống hoàn chỉnh với 2 pha:
-  1. Enrollment (Đăng ký): Nạp ảnh → Trích xuất minutiae → Lưu vào DB
-  2. Matching  (Nhận dạng): Ảnh truy vấn → Trích xuất → So khớp với DB → Trả kết quả
-
-Thiết kế Database (SQLite):
-  ┌─────────────────────────────────────────────────────────────────┐
-  │ Bảng: Users                                                     │
-  │ ├── user_id      INTEGER PRIMARY KEY AUTOINCREMENT              │
-  │ ├── name         TEXT NOT NULL                                  │
-  │ ├── role         TEXT DEFAULT 'Student'                         │
-  │ └── created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP            │
-  │                                                                 │
-  │ Bảng: Fingerprint_Templates                                    │
-  │ ├── template_id  INTEGER PRIMARY KEY AUTOINCREMENT              │
-  │ ├── user_id      INTEGER FOREIGN KEY → Users(user_id)           │
-  │ ├── finger_index TEXT (e.g. 'right_thumb')                      │
-  │ ├── minutiae_data TEXT (JSON: [{x,y,type,angle}, ...])          │
-  │ ├── minutiae_count INTEGER                                      │
-  │ ├── source_image TEXT (đường dẫn ảnh gốc)                       │
-  │ └── created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP            │
-  │                                                                 │
-  │ Quan hệ: Users (1) ──── (N) Fingerprint_Templates              │
-  │ (1 người có thể đăng ký nhiều ngón tay)                        │
-  └─────────────────────────────────────────────────────────────────┘
-
-Lưu trữ minutiae: Dạng JSON (Cách 1)
-  Ví dụ: [{"x": 120, "y": 95, "type": 1, "angle": 1.57}, ...]
-  → SELECT 1 lần lấy hết template → Load vào numpy → Chạy matching
+Mục tiêu:
+  1. Loại bỏ cấu trúc User, chuyển sang một bảng Fingerprints đồng nhất.
+  2. Bổ sung trường `cluster_id` để mô tả nhãn phân cụm khi dùng IVF.
+  3. Áp dụng FAISS `IndexIVFFlat` phân cụm và search top-5 
+     thay cho thao tác for vét cạn từng fingerprint.
 """
 
 import sqlite3
@@ -36,6 +13,7 @@ import json
 import numpy as np
 import cv2
 import os
+import faiss
 import time
 import matplotlib.pyplot as plt
 
@@ -46,12 +24,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
 DB_PATH = os.path.join(BASE_DIR, "fingerprint.db")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+FAISS_INDEX_PATH = os.path.join(BASE_DIR, "faiss_ivf.index")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MATCH_THRESHOLD = 0.48
+# Thông số FAISS (K-Nearest Neighbors)
+TARGET_KNN = 5
+FAISS_DIM = 320 # 5 bands * 8 sectors * 8 Gabor angles
 
 # ============================================================================
-# IMPORT PIPELINE TỪ CÁC BƯỚC TRƯỚC
+# IMPORT TỪ BƯỚC FEATURE EXTRACTION (08)
 # ============================================================================
 from importlib.util import spec_from_file_location, module_from_spec
 
@@ -61,499 +42,302 @@ def _import_module(name, filepath):
     spec.loader.exec_module(mod)
     return mod
 
-step03 = _import_module("s03", os.path.join(BASE_DIR, "03_enhancement.py"))
-step04 = _import_module("s04", os.path.join(BASE_DIR, "04_orientation_field.py"))
-step05 = _import_module("s05", os.path.join(BASE_DIR, "05_frequency_estimation.py"))
-step06 = _import_module("s06", os.path.join(BASE_DIR, "06_gabor_filter.py"))
-step07 = _import_module("s07", os.path.join(BASE_DIR, "07_binarize_thin.py"))
-step08 = _import_module("s08", os.path.join(BASE_DIR, "08_minutiae_extraction.py"))
-step09 = _import_module("s09", os.path.join(BASE_DIR, "09_matching.py"))
-
-extract_features = step09.extract_features
-match_fingerprints = step09.match_fingerprints
-
+step08 = _import_module("s08", os.path.join(BASE_DIR, "08_fingercode_extraction.py"))
+extract_features = step08.extract_features
 
 # ============================================================================
-# LỚP DATABASE: Quản lý kết nối và thao tác SQL
+# DATABSE MANAGER QUẢN LÝ SQLITE + FAISS
 # ============================================================================
-class FingerprintDatabase:
-    """
-    Lớp quản lý cơ sở dữ liệu vân tay.
-    Sử dụng SQLite - không cần cài server, dữ liệu lưu trong 1 file .db
-    """
-
+class FingerprintVectorDB:
     def __init__(self, db_path):
-        """Khởi tạo kết nối đến database."""
         self.db_path = db_path
         self.conn = None
         self.cursor = None
-
+        self.index = None
+    
     def connect(self):
-        """Mở kết nối đến database."""
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row  # Cho phép truy cập cột bằng tên
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
-        # Bật Foreign Key support (SQLite mặc định TẮT)
-        self.cursor.execute("PRAGMA foreign_keys = ON")
         print(f"  Đã kết nối database: {self.db_path}")
+        
+        self._init_tables()
+        self._load_or_create_index()
 
     def close(self):
-        """Đóng kết nối."""
         if self.conn:
             self.conn.close()
             print("  Đã đóng kết nối database.")
 
-    # ────────────────────────────────────────────────────────────────────
-    # TẠO BẢNG (CREATE)
-    # ────────────────────────────────────────────────────────────────────
-    def create_tables(self):
-        """
-        Tạo các bảng trong database nếu chưa tồn tại.
-        """
-        # Bảng Users: Thông tin người dùng
+    def _init_tables(self):
+        """Tạo cấu trúc bảng mới (chỉ một bảng Fingerprints)."""
+        self.cursor.execute("DROP TABLE IF EXISTS Fingerprint_Templates")
+        self.cursor.execute("DROP TABLE IF EXISTS Users")
+        
         self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Users (
-                user_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT NOT NULL,
-                role        TEXT DEFAULT 'Student',
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            CREATE TABLE IF NOT EXISTS Fingerprints (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_image   TEXT NOT NULL,
+                feature_vector TEXT NOT NULL,
+                cluster_id     INTEGER DEFAULT -1,
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # Bảng Fingerprint_Templates: Dữ liệu sinh trắc
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Fingerprint_Templates (
-                template_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id         INTEGER NOT NULL,
-                finger_index    TEXT DEFAULT 'unknown',
-                minutiae_data   TEXT NOT NULL,
-                minutiae_count  INTEGER NOT NULL,
-                source_image    TEXT,
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES Users(user_id)
-                    ON DELETE CASCADE
-            )
-        """)
-
         self.conn.commit()
-        print("  Đã tạo bảng Users và Fingerprint_Templates.")
+
+    def _load_or_create_index(self):
+        """Khởi tạo FAISS Index. Nạp từ đĩa nếu có."""
+        if os.path.exists(FAISS_INDEX_PATH):
+            self.index = faiss.read_index(FAISS_INDEX_PATH)
+            print(f"  Đã load FAISS Index từ {FAISS_INDEX_PATH} (Tổng vector: {self.index.ntotal})")
+        else:
+            print("  FAISS Index chưa tồn tại. Sẽ tạo lúc Build/Enrollment.")
+            self.index = None
 
     # ────────────────────────────────────────────────────────────────────
-    # PHA ĐĂNG KÝ (ENROLLMENT)
+    # PHA 1: ENROLLMENT (ĐĂNG KÝ VÀ BUILD INDEX HÀNG LOẠT)
     # ────────────────────────────────────────────────────────────────────
-    def add_user(self, name, role="Student"):
+    def batch_enroll_and_build(self, feature_data_list):
         """
-        Thêm người dùng mới vào bảng Users.
-        INSERT INTO Users (name, role) VALUES (?, ?)
-
-        Returns: user_id của người dùng vừa thêm
+        Nạp một danh sách các tuple [(source_image, feature_vector), ...]
+        Xây dựng Index IVF, lấy cluster ID và insert vào SQLite.
         """
-        self.cursor.execute(
-            "INSERT INTO Users (name, role) VALUES (?, ?)",
-            (name, role)
-        )
-        self.conn.commit()
-        user_id = self.cursor.lastrowid
-        print(f"  [INSERT] User: '{name}' (ID={user_id}, Role={role})")
-        return user_id
+        # Nếu số lượng ít quá (dưới 10), faiss sẽ khó build IVF.
+        # Nhưng để demo thuật toán IVF, ta chốt cố định nlist nhỏ, ví dụ 2.
+        num_vectors = len(feature_data_list)
+        if num_vectors == 0:
+            return
+            
+        d = len(feature_data_list[0][1])  # dimension
+        nlist = max(2, min(5, num_vectors // 5))  # Ví dụ: tối thiểu 2 cụm, kích thước tùy ý
+        
+        # Array vectors float32 của Faiss
+        xb = np.array([item[1] for item in feature_data_list], dtype=np.float32)
+        
+        # Định nghĩa Index IVF
+        quantizer = faiss.IndexFlatL2(d)
+        index_ivf = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+        
+        # Train index
+        print(f"  [FAISS] Đang huấn luyện IndexIVFFlat với {nlist} cụm...")
+        index_ivf.train(xb)
+        
+        # Tìm Cụm (Cluster ID) của mỗi vector để lưu vào database
+        _, cluster_ids_db = quantizer.search(xb, 1)
+        
+        inserted_ids = []
+        for i, (source_img, vector) in enumerate(feature_data_list):
+            cluster_assign = int(cluster_ids_db[i][0])
+            json_vector = json.dumps(vector.tolist())
+            
+            # Ghi vào SQLite
+            self.cursor.execute("""
+                INSERT INTO Fingerprints (source_image, feature_vector, cluster_id)
+                VALUES (?, ?, ?)
+            """, (source_img, json_vector, cluster_assign))
+            self.conn.commit()
+            
+            inserted_id = self.cursor.lastrowid
+            inserted_ids.append(inserted_id)
+            print(f"  [DB] Đã lưu {os.path.basename(source_img)} -> ID={inserted_id}, Cluster={cluster_assign}")
+            
+        # Nạp dữ liệu vào FAISS index với index.add_with_ids
+        # Chú ý ids phải là int64 array và đúng số lượng
+        ids_array = np.array(inserted_ids, dtype=np.int64)
+        index_ivf.add_with_ids(xb, ids_array)
+        
+        # Lưu index và gán lên class
+        faiss.write_index(index_ivf, FAISS_INDEX_PATH)
+        self.index = index_ivf
+        print(f"  [FAISS] Hoàn tất build và ghi đĩa FAISS Index (kích thước {self.index.ntotal} records).")
 
-    def enroll_fingerprint(self, user_id, minutiae, finger_index="unknown",
-                           source_image=""):
-        """
-        Đăng ký vân tay: Chuyển minutiae thành JSON → INSERT vào DB.
-
-        Pha Enrollment:
-          1. Ảnh vân tay → Pipeline trích xuất → minutiae array
-          2. Chuyển minutiae array → JSON string
-          3. INSERT INTO Fingerprint_Templates (...)
-
-        Cấu trúc JSON:
-          [{"x": 120, "y": 95, "type": 1, "angle": 1.5708}, ...]
-
-        Tham số:
-          user_id:      ID người dùng (Foreign Key → Users)
-          minutiae:     Numpy array [x, y, type, angle] từ pipeline
-          finger_index: Tên ngón tay (e.g. "right_thumb")
-          source_image: Đường dẫn ảnh gốc (để tham chiếu)
-        """
-        # Chuyển numpy array → list of dicts → JSON string
-        minutiae_list = []
-        for m in minutiae:
-            minutiae_list.append({
-                "x": float(m[0]),
-                "y": float(m[1]),
-                "type": int(m[2]),
-                "angle": float(m[3])
-            })
-
-        json_data = json.dumps(minutiae_list)
-        count = len(minutiae_list)
-
-        self.cursor.execute("""
-            INSERT INTO Fingerprint_Templates
-                (user_id, finger_index, minutiae_data, minutiae_count, source_image)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, finger_index, json_data, count, source_image))
-
-        self.conn.commit()
-        template_id = self.cursor.lastrowid
-        print(f"  [INSERT] Template ID={template_id}: "
-              f"User={user_id}, Finger={finger_index}, "
-              f"Minutiae={count}, Image={os.path.basename(source_image)}")
-        return template_id
 
     # ────────────────────────────────────────────────────────────────────
-    # PHA NHẬN DẠNG (MATCHING / IDENTIFICATION)
+    # PHA 2: MATCHING VÀ LẤY VỀ KNN (TÌM TOP-5)
     # ────────────────────────────────────────────────────────────────────
-    def get_all_templates(self):
+    def search_top_k(self, query_vector, k=TARGET_KNN):
         """
-        Lấy tất cả template từ database.
-        SELECT ... FROM Fingerprint_Templates JOIN Users
-
-        Returns: list of dict với thông tin user + minutiae
+        Tìm K dấu vân tay gần nhất từ vector truy vấn.
         """
-        self.cursor.execute("""
-            SELECT
-                ft.template_id,
-                ft.user_id,
-                u.name,
-                u.role,
-                ft.finger_index,
-                ft.minutiae_data,
-                ft.minutiae_count,
-                ft.source_image
-            FROM Fingerprint_Templates ft
-            JOIN Users u ON ft.user_id = u.user_id
-        """)
-
-        results = []
-        for row in self.cursor.fetchall():
-            # Parse JSON → numpy array
-            minutiae_list = json.loads(row["minutiae_data"])
-            minutiae_array = np.array([
-                [m["x"], m["y"], m["type"], m["angle"]]
-                for m in minutiae_list
-            ]) if minutiae_list else np.array([]).reshape(0, 4)
-
-            results.append({
-                "template_id": row["template_id"],
-                "user_id": row["user_id"],
-                "name": row["name"],
-                "role": row["role"],
-                "finger_index": row["finger_index"],
-                "minutiae": minutiae_array,
-                "minutiae_count": row["minutiae_count"],
-                "source_image": row["source_image"],
-            })
-
-        return results
-
-    def identify(self, query_minutiae, alpha_range=5):
-        """
-        Nhận dạng: So khớp minutiae truy vấn với TẤT CẢ template trong DB.
-
-        Pha Matching:
-          1. Trích xuất minutiae từ ảnh truy vấn
-          2. SELECT tất cả template từ DB
-          3. So khớp query vs mỗi template → Tính score
-          4. Trả về danh sách xếp hạng theo score giảm dần
-
-        Returns:
-          results: List of (name, score, match, template_info) sắp xếp theo score
-        """
-        templates = self.get_all_templates()
-
-        if not templates:
-            print("  Cảnh báo: Database trống, không có template nào!")
+        if self.index is None or not self.index.is_trained:
+            print("  Lỗi: FAISS Index chưa sẵn sàng!")
             return []
-
-        print(f"  Đang so khớp với {len(templates)} template trong database...")
-
+            
+        # Thao tác bắt buộc với IVF để cải thiện tìm kiếm: tăng nprobe
+        self.index.nprobe = 3 # Quét 3 centroid gần nhất (do tập dữ liệu nhỏ)
+        
+        # Chuyển đổi và search
+        xq = np.array([query_vector], dtype=np.float32)
+        
+        start_time = time.time()
+        distances, indices = self.index.search(xq, k)
+        elapsed = time.time() - start_time
+        
         results = []
-        for tmpl in templates:
-            print(f"    So khớp với {tmpl['name']} ({tmpl['finger_index']})...", end="")
-            t0 = time.time()
-
-            score, _, _, _ = match_fingerprints(
-                query_minutiae, tmpl["minutiae"], alpha_range=alpha_range
-            )
-
-            elapsed = time.time() - t0
-            is_match = score > MATCH_THRESHOLD
-            icon = "★" if is_match else "·"
-            print(f" Score={score:.4f} {icon} ({elapsed:.1f}s)")
-
-            results.append({
-                "name": tmpl["name"],
-                "user_id": tmpl["user_id"],
-                "finger_index": tmpl["finger_index"],
-                "template_id": tmpl["template_id"],
-                "score": score,
-                "match": is_match,
-                "source_image": tmpl["source_image"],
-            })
-
-        # Sắp xếp theo score giảm dần
-        results.sort(key=lambda r: r["score"], reverse=True)
+        for idx_order, db_id in enumerate(indices[0]):
+            if db_id == -1: continue # FAISS trả -1 nếu không đủ kết quả k
+            
+            # Retrieve from SQL
+            self.cursor.execute("SELECT source_image, cluster_id FROM Fingerprints WHERE id = ?", (int(db_id),))
+            row = self.cursor.fetchone()
+            if row:
+                dist_score = distances[0][idx_order]
+                # Nếu normalized vectors, Cosine Similarity liên hệ trực tiếp qua L2 distance, 
+                # distance nhỏ -> càng giống. Đổi ra dạng score (vd: 1 / (1 + distance)) cho dễ nhìn
+                sim_score = 1.0 / (1.0 + dist_score)
+                
+                results.append({
+                    "id": db_id,
+                    "source_image": row["source_image"],
+                    "cluster_id": row["cluster_id"],
+                    "distance": dist_score,
+                    "similarity": sim_score
+                })
+                
+        print(f"  [FAISS Search] Mất {elapsed*1000:.2f}ms để hoàn tất IVF Query.")
         return results
 
-    # ────────────────────────────────────────────────────────────────────
-    # TRUY VẤN THÔNG TIN (QUERY)
-    # ────────────────────────────────────────────────────────────────────
-    def get_all_users(self):
-        """SELECT * FROM Users"""
-        self.cursor.execute("SELECT * FROM Users")
+    def get_all_records(self):
+        """Thống kê chi tiết Database"""
+        self.cursor.execute("SELECT id, source_image, cluster_id, created_at FROM Fingerprints")
         return [dict(row) for row in self.cursor.fetchall()]
-
-    def get_user_templates(self, user_id):
-        """SELECT templates cho 1 user cụ thể."""
-        self.cursor.execute(
-            "SELECT * FROM Fingerprint_Templates WHERE user_id = ?",
-            (user_id,)
-        )
-        return [dict(row) for row in self.cursor.fetchall()]
-
-    def get_stats(self):
-        """Thống kê database."""
-        self.cursor.execute("SELECT COUNT(*) FROM Users")
-        n_users = self.cursor.fetchone()[0]
-        self.cursor.execute("SELECT COUNT(*) FROM Fingerprint_Templates")
-        n_templates = self.cursor.fetchone()[0]
-        return n_users, n_templates
-
 
 # ============================================================================
-# CHƯƠNG TRÌNH CHÍNH: Demo Enrollment + Matching
+# CHƯƠNG TRÌNH CHÍNH TỔNG HỢP (ENROLL + MATCHING)
 # ============================================================================
 def main():
     print("=" * 60)
-    print("  HỆ THỐNG NHẬN DẠNG VÂN TAY")
-    print("  Fingerprint Recognition System")
+    print("  HỆ THỐNG IVF VÀ ĐẶC TRƯNG CỐ ĐỊNH (FINGERCODE)")
     print("=" * 60)
 
-    # === Khởi tạo Database ===
-    # Xóa DB cũ nếu có để tạo mới (demo)
+    # Đặt lại hệ thống Demo
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
+    if os.path.exists(FAISS_INDEX_PATH):
+        os.remove(FAISS_INDEX_PATH)
 
-    db = FingerprintDatabase(DB_PATH)
+    db = FingerprintVectorDB(DB_PATH)
     db.connect()
-    db.create_tables()
 
-    # =========================================================================
-    # PHA 1: ENROLLMENT (Đăng ký)
-    # =========================================================================
+    # == PHA 1: ENROLLMENT ==
     print("\n" + "=" * 60)
-    print("  PHA 1: ENROLLMENT (Đăng ký vân tay)")
+    print("  PHA 1: ENROLLMENT VÀ QUẢN LÝ VECTOR TẬP TRUNG")
     print("=" * 60)
 
-    # Dữ liệu giả lập: Mỗi subject (101-110) = 1 người, mỗi người 8 ảnh
-    enrollment_data = [
-        {"name": "Nguyen Van A", "role": "Student",  "subject": "101", "samples": ["1", "2"]},
-        {"name": "Tran Thi B",   "role": "Student",  "subject": "102", "samples": ["1", "2"]},
-        {"name": "Le Van C",     "role": "Lecturer", "subject": "103", "samples": ["1", "2"]},
-        {"name": "Pham Thi D",   "role": "Student",  "subject": "104", "samples": ["1"]},
+    enroll_samples = [
+        "101_1.tif", "101_2.tif", "101_3.tif", 
+        "102_1.tif", "102_2.tif", 
+        "103_1.tif", "103_2.tif", 
+        "104_1.tif", "105_1.tif", "106_1.tif"
     ]
+    
+    extracted_data = [] # Lưu trữ [(path, feature_vec), ...] để làm batch_enroll
+    
+    for sample in enroll_samples:
+        img_path = os.path.join(DATASET_PATH, sample)
+        if not os.path.exists(img_path):
+            print(f"  [SKIP] Khong thay anh: {sample}")
+            continue
+            
+        print(f"  Đang trích xuất Fingercode cho ảnh {sample}...")
+        vector, _ = extract_features(img_path)
+        if vector is not None and len(vector) > 0:
+            extracted_data.append((img_path, vector))
+        else:
+            print(f"  [FAIL] Lỗi trích xuất trên {sample}")
+            
+    # Gửi qua DB Controller xử lý insert và xây dựng Faiss IVF
+    if extracted_data:
+        db.batch_enroll_and_build(extracted_data)
 
-    for person in enrollment_data:
-        print(f"\n{'─' * 50}")
-        print(f"  Đăng ký: {person['name']} ({person['role']})")
-        print(f"{'─' * 50}")
+    # In thông tin bảng
+    records = db.get_all_records()
+    print(f"\n  SQL Table Fingerprints ({len(records)} records):")
+    print(f"  {'ID':<5} {'Source File':<20} {'Cluster ID':<10}")
+    print(f"  {'-'*5} {'-'*20} {'-'*10}")
+    for item in records:
+         filename = os.path.basename(item["source_image"])
+         print(f"  {item['id']:<5} {filename:<20} {item['cluster_id']:<10}")
 
-        # Thêm user
-        user_id = db.add_user(person["name"], person["role"])
-
-        # Đăng ký từng mẫu vân tay
-        for sample in person["samples"]:
-            filename = f"{person['subject']}_{sample}.tif"
-            img_path = os.path.join(DATASET_PATH, filename)
-
-            if not os.path.exists(img_path):
-                print(f"  [SKIP] Không tìm thấy {filename}")
-                continue
-
-            print(f"  Đang trích xuất từ {filename}...")
-            minutiae, _ = extract_features(img_path)
-
-            if minutiae is not None and len(minutiae) > 0:
-                db.enroll_fingerprint(
-                    user_id=user_id,
-                    minutiae=minutiae,
-                    finger_index=f"right_thumb_sample{sample}",
-                    source_image=img_path
-                )
-            else:
-                print(f"  [FAIL] Không trích xuất được minutiae từ {filename}")
-
-    # Thống kê sau enrollment
-    n_users, n_templates = db.get_stats()
-    print(f"\n  ✓ Enrollment hoàn tất: {n_users} users, {n_templates} templates")
-
-    # =========================================================================
-    # PHA 2: MATCHING (Nhận dạng / Xác thực)
-    # =========================================================================
+    # == PHA 2: MATCHING (QUERY TÌM TOP-5) ==
     print("\n" + "=" * 60)
-    print("  PHA 2: MATCHING (Nhận dạng vân tay)")
+    print("  PHA 2: MATCHING (KNN-SEARCH BẰNG FAISS IVF)")
     print("=" * 60)
-
-    # Test Case 1: Ảnh của Nguyen Van A (101_3.tif) - nên match với 101
-    # Test Case 2: Ảnh của người lạ (105_1.tif) - không nên match với ai
-    queries = [
-        ("101_3.tif", "Ảnh của Nguyen Van A (mẫu khác)"),
-        ("105_1.tif", "Ảnh người lạ (không có trong DB)"),
+    
+    test_queries = [
+        ("101_4.tif", "Cùng vân 101, chưa tồn tại trong Db"), 
+        ("106_2.tif", "Cùng vân 106, chưa tồn tại trong Db")
     ]
-
-    all_results = []
-
-    for query_file, description in queries:
+    
+    all_query_results = []
+    for q_file, desc in test_queries:
         print(f"\n{'─' * 50}")
-        print(f"  QUERY: {query_file}")
-        print(f"  Mô tả: {description}")
+        print(f"  QUERY IMAGE: {q_file} ({desc})")
         print(f"{'─' * 50}")
-
-        query_path = os.path.join(DATASET_PATH, query_file)
-        if not os.path.exists(query_path):
-            print(f"  Lỗi: Không tìm thấy {query_file}")
+        
+        q_path = os.path.join(DATASET_PATH, q_file)
+        if not os.path.exists(q_path):
+            print(f"  => [SKIP] Tệp {q_path} không tồn tại!")
             continue
-
-        # Trích xuất minutiae từ ảnh truy vấn
-        print(f"  Đang trích xuất đặc trưng từ {query_file}...")
-        query_minutiae, query_img = extract_features(query_path)
-
-        if query_minutiae is None or len(query_minutiae) == 0:
-            print(f"  Lỗi: Không trích xuất được minutiae")
+            
+        t0 = time.time()
+        q_vec, q_img = extract_features(q_path)
+        t_ext = time.time() - t0
+        print(f"  [Time] Trích xuất vector: {t_ext*1000:.1f}ms")
+        
+        if q_vec is None:
             continue
+            
+        # Gọi Search (Không dùng Loop O(N)!)
+        top_k_list = db.search_top_k(q_vec, k=TARGET_KNN)
+        
+        print(f"\n  > --- KẾT QUẢ TOP {TARGET_KNN} TƯƠNG ĐỒNG NHẤT --- <")
+        for i, item in enumerate(top_k_list, 1):
+             file_base = os.path.basename(item['source_image'])
+             print(f"    R {i}: {file_base:<15} | Sim Score: {item['similarity']:.4f} "
+                   f"| L2: {item['distance']:.4f} | Cluster: {item['cluster_id']}")
 
-        print(f"  → {len(query_minutiae)} minutiae")
-
-        # So khớp với database
-        results = db.identify(query_minutiae, alpha_range=5)
-
-        if results:
-            best = results[0]
-            if best["match"]:
-                print(f"\n  ┌─────────────────────────────────────────┐")
-                print(f"  │  ★ NHẬN DẠNG THÀNH CÔNG ★                │")
-                print(f"  │  Danh tính: {best['name']:<27s} │")
-                print(f"  │  Score:     {best['score']:.4f}                       │")
-                print(f"  │  Ngón:      {best['finger_index']:<27s} │")
-                print(f"  └─────────────────────────────────────────┘")
-            else:
-                print(f"\n  ┌─────────────────────────────────────────┐")
-                print(f"  │  ✗ KHÔNG TÌM THẤY DANH TÍNH             │")
-                print(f"  │  Score cao nhất: {best['score']:.4f} (< {MATCH_THRESHOLD})       │")
-                print(f"  │  Người gần nhất: {best['name']:<22s} │")
-                print(f"  └─────────────────────────────────────────┘")
-
-        all_results.append({
-            "query": query_file,
-            "description": description,
-            "results": results,
-            "query_img": query_img,
+        all_query_results.append({
+            "query": q_file,
+            "desc": desc,
+            "img": q_img,
+            "top_k": top_k_list
         })
-
-    # =========================================================================
-    # HIỂN THỊ DATABASE
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("  NỘI DUNG DATABASE")
-    print("=" * 60)
-
-    users = db.get_all_users()
-    print(f"\n  Bảng Users ({len(users)} records):")
-    print(f"  {'ID':<5s} {'Name':<20s} {'Role':<12s} {'Created'}")
-    print(f"  {'─'*5} {'─'*20} {'─'*12} {'─'*20}")
-    for u in users:
-        print(f"  {u['user_id']:<5d} {u['name']:<20s} {u['role']:<12s} {u['created_at']}")
-
-    templates = db.get_all_templates()
-    print(f"\n  Bảng Fingerprint_Templates ({len(templates)} records):")
-    print(f"  {'TID':<5s} {'UID':<5s} {'Name':<18s} {'Finger':<25s} {'#Min':<6s} {'Image'}")
-    print(f"  {'─'*5} {'─'*5} {'─'*18} {'─'*25} {'─'*6} {'─'*15}")
-    for t in templates:
-        img_name = os.path.basename(t["source_image"]) if t["source_image"] else "N/A"
-        print(f"  {t['template_id']:<5d} {t['user_id']:<5d} {t['name']:<18s} "
-              f"{t['finger_index']:<25s} {t['minutiae_count']:<6d} {img_name}")
-
-    # =========================================================================
-    # TRỰC QUAN HÓA KẾT QUẢ
-    # =========================================================================
-    if all_results:
-        n_queries = len(all_results)
-        fig, axes = plt.subplots(n_queries, 1, figsize=(14, 5 * n_queries))
-        if n_queries == 1:
-            axes = [axes]
-
-        fig.suptitle("Fingerprint Identification Results",
-                     fontsize=16, fontweight='bold')
-
-        for idx, qr in enumerate(all_results):
-            ax = axes[idx]
-            ax.axis('off')
-
-            # Tạo text kết quả
-            lines = [f"QUERY: {qr['query']}  ({qr['description']})\n"]
-            lines.append(f"{'Rank':<6s} {'Name':<20s} {'Score':<10s} {'Result':<15s} {'Finger'}")
-            lines.append("─" * 70)
-
-            for rank, r in enumerate(qr['results'], 1):
-                icon = "★ MATCH" if r['match'] else "  -"
-                lines.append(
-                    f"  {rank:<4d} {r['name']:<20s} {r['score']:<10.4f} {icon:<15s} {r['finger_index']}"
-                )
-
-            if qr['results'] and qr['results'][0]['match']:
-                bg = '#d4edda'
-                title = f"✓ Identified: {qr['results'][0]['name']}"
-            else:
-                bg = '#f8d7da'
-                title = "✗ No match found"
-
-            text = "\n".join(lines)
-            ax.text(0.02, 0.95, text, transform=ax.transAxes,
-                    fontsize=10, verticalalignment='top', fontfamily='monospace',
-                    bbox=dict(boxstyle='round', facecolor=bg, alpha=0.8))
-            ax.set_title(title, fontsize=13, fontweight='bold',
-                         color='green' if '✓' in title else 'red')
-
-        plt.tight_layout()
-        path1 = os.path.join(OUTPUT_DIR, "10_database_results.png")
-        plt.savefig(path1, dpi=200, bbox_inches='tight')
-        print(f"\nĐã lưu: {path1}")
-
-    # =========================================================================
-    # TÓM TẮT CUỐI CÙNG
-    # =========================================================================
+        
     db.close()
-
+    
+    # == VISUALIZE KẾT QUẢ TƯƠNG ĐỒNG ==
+    if all_query_results:
+        print("\n  Tạo visualization báo cáo...")
+        n_queries = len(all_query_results)
+        fig, axes = plt.subplots(n_queries, TARGET_KNN + 1, figsize=(15, 3 * n_queries))
+        if n_queries == 1: axes = [axes]
+        
+        for i, qr in enumerate(all_query_results):
+            ax_q = axes[i][0]
+            ax_q.imshow(qr["img"], cmap="gray")
+            ax_q.set_title(f"Query: {qr['query']}\n(Input)")
+            ax_q.axis('off')
+            
+            for j in range(TARGET_KNN):
+                ax_res = axes[i][j+1]
+                if j < len(qr["top_k"]):
+                    match = qr["top_k"][j]
+                    res_img = cv2.imread(match["source_image"], cv2.IMREAD_GRAYSCALE)
+                    if res_img is not None:
+                        ax_res.imshow(res_img, cmap="gray")
+                        s_name = os.path.basename(match['source_image'])
+                        ax_res.set_title(f"#{j+1}: {s_name}\nSim: {match['similarity']:.3f}\nCluster: {match['cluster_id']}")
+                ax_res.axis('off')
+                
+        plt.tight_layout()
+        path_res = os.path.join(OUTPUT_DIR, "10_database_ivf_results.png")
+        plt.savefig(path_res, dpi=200, bbox_inches='tight')
+        print(f"  Đã xuất đồ họa: {path_res}")
+        
     print("\n" + "=" * 60)
-    print("  ★★★ HỆ THỐNG HOÀN TẤT ★★★")
+    print("   ★★★ HOÀN THIỆN XÂY DỰNG FINGERCODE + FAISS IVF ★★★")
     print("=" * 60)
-    print(f"\n  Database file: {DB_PATH}")
-    print(f"  Users:         {n_users}")
-    print(f"  Templates:     {n_templates}")
-    print(f"\n  Cấu trúc Database:")
-    print(f"  ┌─────────────────────────────────────────────┐")
-    print(f"  │ Users                                        │")
-    print(f"  │ ├── user_id (PK)                             │")
-    print(f"  │ ├── name                                     │")
-    print(f"  │ ├── role                                     │")
-    print(f"  │ └── created_at                               │")
-    print(f"  │                    1:N                        │")
-    print(f"  │ Fingerprint_Templates                        │")
-    print(f"  │ ├── template_id (PK)                         │")
-    print(f"  │ ├── user_id (FK → Users)                     │")
-    print(f"  │ ├── finger_index                             │")
-    print(f"  │ ├── minutiae_data (JSON)                     │")
-    print(f"  │ ├── minutiae_count                           │")
-    print(f"  │ ├── source_image                             │")
-    print(f"  │ └── created_at                               │")
-    print(f"  └─────────────────────────────────────────────┘")
-    print(f"\n  Lưu trữ minutiae: JSON")
-    print(f'  VD: [{{"x":120,"y":95,"type":1,"angle":1.57}}, ...]')
-    print(f"\n  2 Luồng hoạt động:")
-    print(f"  ├── Enrollment: Ảnh → Pipeline → INSERT minutiae JSON")
-    print(f"  └── Matching:   Ảnh → Pipeline → SELECT all → So khớp → Kết quả")
 
 
 if __name__ == "__main__":

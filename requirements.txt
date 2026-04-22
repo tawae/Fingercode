@@ -3,3 +3,5 @@ matplotlib
 opencv-python
 scipy
 scikit-image
+faiss-cpu
+PyQt5
