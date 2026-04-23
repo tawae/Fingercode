@@ -3,10 +3,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
+import config
+
 # Đường dẫn tới dataset FVC2002 (DB1_B)
 # Dùng thư mục của file script làm gốc để tránh lỗi không tìm thấy khi gọi từ ngoài thư mục
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
+BASE_DIR = config.BASE_DIR
+DATASET_PATH = config.DATASET_PATH
 SAMPLE_IMAGE = "101_1.tif"
 
 def visualize_fingerprint():

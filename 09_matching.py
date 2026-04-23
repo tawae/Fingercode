@@ -19,10 +19,11 @@ import time
 # ============================================================================
 # CẤU HÌNH
 # ============================================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+import config
+
+BASE_DIR = config.BASE_DIR
+DATASET_PATH = config.DATASET_PATH
+OUTPUT_DIR = config.OUTPUT_DIR
 
 # Ngưỡng phân loại khoảng cách (Tùy thuộc vào việc normalize vector)
 L2_MATCH_THRESHOLD = 0.50 # Distance < Threshold => MATCH

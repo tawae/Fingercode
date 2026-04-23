@@ -3,9 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
+import config
+
 # Đường dẫn (giữ nguyên như bài trước)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
+BASE_DIR = config.BASE_DIR
+DATASET_PATH = config.DATASET_PATH
 SAMPLE_IMAGE = "101_1.tif"
 
 def normalize_image(img):

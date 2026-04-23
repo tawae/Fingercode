@@ -38,7 +38,8 @@ def _import_module(name, filepath):
 step08 = _import_module("s08", os.path.join(BASE_DIR, "08_fingercode_extraction.py"))
 step10 = _import_module("s10", os.path.join(BASE_DIR, "10_database_system.py"))
 
-DB_PATH = os.path.join(BASE_DIR, "fingerprint.db")
+import config
+DB_PATH = config.DB_PATH
 
 # Khởi tạo DB biến toàn cục để tránh load Faiss Index nhiều lần
 global_db = None

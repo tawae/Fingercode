@@ -25,13 +25,12 @@ import os
 # ============================================================================
 # CẤU HÌNH ĐƯỜNG DẪN
 # ============================================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
-SAMPLE_IMAGE = "101_1.tif"
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+import config
 
-# Tạo thư mục output nếu chưa có
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+BASE_DIR = config.BASE_DIR
+DATASET_PATH = config.DATASET_PATH
+OUTPUT_DIR = config.OUTPUT_DIR
+SAMPLE_IMAGE = "101_1.tif"
 
 # ============================================================================
 # HÀM TỪ BƯỚC TRƯỚC (Preprocessing)

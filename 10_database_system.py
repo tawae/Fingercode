@@ -20,16 +20,15 @@ import matplotlib.pyplot as plt
 # ============================================================================
 # CẤU HÌNH
 # ============================================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
-DB_PATH = os.path.join(BASE_DIR, "fingerprint.db")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-FAISS_INDEX_PATH = os.path.join(BASE_DIR, "faiss_ivf.index")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+import config
 
-# Thông số FAISS (K-Nearest Neighbors)
-TARGET_KNN = 5
-FAISS_DIM = 320 # 5 bands * 8 sectors * 8 Gabor angles
+BASE_DIR = config.BASE_DIR
+DATASET_PATH = config.DATASET_PATH
+DB_PATH = config.DB_PATH
+OUTPUT_DIR = config.OUTPUT_DIR
+FAISS_INDEX_PATH = config.FAISS_INDEX_PATH
+TARGET_KNN = config.TARGET_KNN
+FAISS_DIM = config.FAISS_DIM
 
 # ============================================================================
 # IMPORT TỪ BƯỚC FEATURE EXTRACTION (08)
@@ -224,12 +223,18 @@ def main():
     print("  PHA 1: ENROLLMENT VÀ QUẢN LÝ VECTOR TẬP TRUNG")
     print("=" * 60)
 
-    enroll_samples = [
-        "101_1.tif", "101_2.tif", "101_3.tif", 
-        "102_1.tif", "102_2.tif", 
-        "103_1.tif", "103_2.tif", 
-        "104_1.tif", "105_1.tif", "106_1.tif"
-    ]
+    # Tự động lấy toàn bộ file ảnh trong DATASET_PATH (hỗ trợ .tif, .jpg, .png)
+    valid_extensions = ('.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp')
+    all_files = [f for f in os.listdir(DATASET_PATH) if f.lower().endswith(valid_extensions)]
+    all_files.sort() # Sắp xếp để dễ theo dõi
+    
+    # Bạn có thể chọn dùng config.ENROLL_SAMPLES (danh sách chọn lọc) 
+    # hoặc dùng all_files (tất cả ảnh trong thư mục)
+    # Ở đây tôi sẽ ưu tiên lấy tất cả ảnh nếu danh sách trong config là rỗng
+    enroll_samples = config.ENROLL_SAMPLES if config.ENROLL_SAMPLES else all_files
+    
+    print(f"  Tìm thấy {len(all_files)} ảnh trong dataset.")
+    print(f"  Sẽ tiến hành đăng ký {len(enroll_samples)} ảnh vào Database...")
     
     extracted_data = [] # Lưu trữ [(path, feature_vec), ...] để làm batch_enroll
     
