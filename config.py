@@ -8,8 +8,9 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 1. Đường dẫn thư mục Dataset (Tập ảnh vân tay)
-# Thay đổi biến này khi muốn chạy trên bộ dữ liệu khác.
-DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
+# Thay đổi biến này khi muốn chạy trên bộ dữ liệu khác:
+# DATASET_PATH = os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B")
+DATASET_PATH = os.path.join(BASE_DIR, "..", "DataFingerPrint", "Real")
 
 # 2. Đường dẫn lưu trữ SQLite Database
 DB_PATH = os.path.join(BASE_DIR, "fingerprint.db")
