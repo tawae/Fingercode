@@ -5,3 +5,4 @@ scipy
 scikit-image
 faiss-cpu
 PyQt5
+scikit-learn
