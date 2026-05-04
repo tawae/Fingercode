@@ -488,7 +488,9 @@ class FingerprintApp(QMainWindow):
                 file_base = os.path.basename(img_path)
 
                 text_lbl.setText(
-                    f"Rank {i+1}: {file_base}\nSim: {sim:.3f} | Cluster: {clus}"
+                    f"Rank {i+1}: {file_base}\n"
+                    f"UserID: {res.get('user_id','?')} | {res.get('sex','?')} | {res.get('finger_index','?')}\n"
+                    f"Sim: {sim:.3f} | Cluster: {clus}"
                 )
                 if sim > 0.65:
                     text_lbl.setStyleSheet(

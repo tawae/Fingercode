@@ -15,14 +15,6 @@ env/
 *.db
 *.sqlite3
 
-# Output results and temporary images
-output/
-*.png
-*.jpg
-*.jpeg
-*.tif
-*.tiff
-
 .DS_Store
 
 SOCOFing/

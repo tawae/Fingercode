@@ -3,6 +3,7 @@ import glob
 import importlib
 import json
 import csv
+import time
 from sklearn.metrics import precision_score, recall_score, accuracy_score
 import config
 
@@ -14,9 +15,23 @@ database_system = importlib.import_module("10_database_system")
 FingerprintVectorDB = database_system.FingerprintVectorDB
 
 def evaluate_system():
-    # Đường dẫn tới tập ảnh đã bị làm nhiễu
-    test_dir = "./SOCOFing/Altered/Altered-Easy"
-    test_files = glob.glob(os.path.join(test_dir, "*.BMP"))
+    t_start = time.time()
+    # Đường dẫn tới tập ảnh Altered-Easy (tuyệt đối)
+    _base = os.path.dirname(os.path.abspath(__file__))
+    test_dir = os.path.join(_base, "SOCOFing", "Altered", "Altered-Easy")
+    all_test_files = sorted(glob.glob(os.path.join(test_dir, "*.BMP")))
+
+    # Lọc chỉ giữ user_id 1-50 (50 người đầu tiên)
+    MAX_USER_ID_EVAL = 50
+    test_files = []
+    for fp in all_test_files:
+        parts = os.path.basename(fp).split('__')
+        if len(parts) >= 2:
+            try:
+                if 1 <= int(parts[0]) <= MAX_USER_ID_EVAL:
+                    test_files.append(fp)
+            except ValueError:
+                pass
     
     y_true = []
     y_pred_top1 = []
@@ -27,7 +42,7 @@ def evaluate_system():
 
     results_details = []
 
-    print(f"Bắt đầu đánh giá trên {len(test_files)} ảnh...")
+    print(f"Bắt đầu đánh giá trên {len(test_files)} ảnh (user_id 1-{MAX_USER_ID_EVAL}) từ Altered-Easy...")
 
     # Khởi tạo kết nối tới Database FAISS
     print(f"Kết nối tới DB FAISS tại: {config.DB_PATH}")
@@ -122,18 +137,25 @@ def evaluate_system():
     db.close()
 
     # 3. Tính toán các chỉ số
-    # Sử dụng average='macro' để tính trung bình đều cho tất cả các nhãn (người dùng)
+    elapsed = time.time() - t_start
+    # QUAN TRỌNG: labels=sorted(set(y_true)) để chỉ tính macro trên các user_id
+    # thực sự có trong tập test. Nếu không, các predicted user_id ngoài tập test
+    # (vd: user 51-300 trong DB) tạo thêm class "ma" với precision=0, kéo kết quả xuống.
+    eval_labels = sorted(set(y_true))
     acc_top1 = accuracy_score(y_true, y_pred_top1)
-    precision = precision_score(y_true, y_pred_top1, average='macro', zero_division=0)
-    recall = recall_score(y_true, y_pred_top1, average='macro', zero_division=0)
+    precision = precision_score(y_true, y_pred_top1, average='macro', labels=eval_labels, zero_division=0)
+    recall = recall_score(y_true, y_pred_top1, average='macro', labels=eval_labels, zero_division=0)
     acc_top5 = correct_top5_count / total_queries if total_queries > 0 else 0
+    avg_time = elapsed / total_queries if total_queries > 0 else 0
 
     metrics = {
         "Total_Images": total_queries,
         "Top-1_Accuracy": round(acc_top1, 4),
         "Top-5_Accuracy": round(acc_top5, 4),
         "Macro_Precision": round(precision, 4),
-        "Macro_Recall": round(recall, 4)
+        "Macro_Recall": round(recall, 4),
+        "Total_Time_Seconds": round(elapsed, 2),
+        "Avg_Time_Per_Query_ms": round(avg_time * 1000, 2)
     }
 
     print("\n=== KẾT QUẢ ĐÁNH GIÁ HỆ THỐNG ===")
@@ -142,6 +164,8 @@ def evaluate_system():
     print(f"Top-5 Accuracy : {acc_top5:.4f}")
     print(f"Macro Precision: {precision:.4f}")
     print(f"Macro Recall   : {recall:.4f}")
+    print(f"Tổng thời gian : {elapsed:.1f}s")
+    print(f"TB mỗi query   : {avg_time*1000:.1f}ms")
 
     # --- LƯU KẾT QUẢ ---
     
@@ -179,6 +203,8 @@ def evaluate_system():
         f.write(f"Top-5 Accuracy : {acc_top5:.4f}\n")
         f.write(f"Macro Precision: {precision:.4f}\n")
         f.write(f"Macro Recall   : {recall:.4f}\n")
+        f.write(f"Tổng thời gian : {elapsed:.1f}s\n")
+        f.write(f"TB mỗi query   : {avg_time*1000:.1f}ms\n")
         f.write("\n=== CHI TIẾT ===\n")
         for item in results_details:
             top_5_str = ", ".join(map(str, item['top_5_ids']))
