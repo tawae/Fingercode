@@ -6,7 +6,7 @@
 1. CẤU HÌNH ĐÁNH GIÁ
    Gallery     : Real images (SOCOFing)
    Probe       : Altered-Easy (biến thể _CR)
-   Matching    : KD-Tree + Poincare alignment
+   Matching    : Fingercode + L2 similarity
    Genuine Pairs : 493
    Impostor Pairs: 493
 

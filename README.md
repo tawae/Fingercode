@@ -1,124 +1,98 @@
 # Fingerprint Recognition System in Python
 
-Dự án này là một hệ thống nhận dạng vân tay hoàn chỉnh được cài đặt bằng Python. Dự án chuyển đổi các thuật toán xử lý vân tay kinh điển (thường dùng trong MATLAB) sang Python, bao gồm toàn bộ quy trình: từ tiền xử lý ảnh, lọc Gabor, trích xuất đặc trưng (Minutiae), so khớp (Matching), cho đến quản lý dữ liệu với SQLite.
+He thong nhan dang van tay nay dung pipeline Fingercode + FAISS IVF:
 
-## Mục lục
-- [Luồng Hệ Thống (System Pipeline)](#-luồng-hệ-thống-system-pipeline)
-- [Thư viện sử dụng](#-thư-viện-sử-dụng)
-- [Cài đặt (Installation)](#-cài-đặt-installation)
-- [Cấu trúc Thư mục & Dữ liệu](#-cấu-trúc-thư-mục--dữ-liệu)
-- [Cách sử dụng (Usage)](#-cách-sử-dụng-usage)
-- [Cấu trúc Cơ sở dữ liệu](#-cấu-trúc-cơ-sở-dữ-liệu)
+1. Nap san 3000 anh SOCOFing Real dau tien vao SQLite va FAISS index.
+2. GUI PyQt5 cho phep chon/keo tha mot anh truy van va tra ve 5 anh gan nhat.
+3. Hai script danh gia do chinh xac va nguong nhan dang.
 
----
+## Luong he thong
 
-## Luồng Hệ Thống (System Pipeline)
+Luong xu ly anh dung chung cho build DB, GUI va evaluation:
 
-Hệ thống được chia thành 10 bước (tương ứng với 10 file script), thực thi tuần tự để biến một bức ảnh vân tay thô thành thông tin định danh:
-
-1. **Visualize (`01_visualize_fingerprint.py`):** Đọc ảnh vân tay (Grayscale) và vẽ biểu đồ Histogram để phân biệt đường vân (Ridge) và nền (Valley).
-2. **Preprocessing (`02_preprocessing.py`):** Chuẩn hóa độ sáng (Normalization) và cắt bỏ nền thừa (Segmentation) dựa trên phương sai (Variance).
-3. **Enhancement (`03_enhancement.py`):** Tăng cường độ tương phản cục bộ sử dụng thuật toán CLAHE (thay vì FFT như nguyên bản) để làm rõ đường vân.
-4. **Orientation Field (`04_orientation_field.py`):** Ước lượng hướng của đường vân tại từng pixel bằng bộ lọc Sobel và ma trận Hiệp phương sai (Covariance).
-5. **Frequency Estimation (`05_frequency_estimation.py`):** Ước lượng tần số (khoảng cách giữa các đường vân) bằng cách xoay block ảnh và phân tích hình sin của các điểm ảnh.
-6. **Gabor Filter (`06_gabor_filter.py`):** Áp dụng bộ lọc Gabor 2D dựa trên Hướng (bước 4) và Tần số (bước 5) để làm mịn vân tay và loại bỏ nhiễu.
-7. **Binarize & Thinning (`07_binarize_thin.py`):** Nhị phân hóa ảnh về dạng Đen/Trắng và làm mảnh đường vân (Skeletonization) xuống kích thước 1 pixel.
-8. **Minutiae Extraction (`08_minutiae_extraction.py`):** Sử dụng thuật toán **Crossing Number** để tìm các điểm đặc trưng: Điểm kết thúc (Termination) và Điểm rẽ nhánh (Bifurcation). Loại bỏ các điểm giả mạo (False Minutiae).
-9. **Matching (`09_matching.py`):** So khớp 2 tập hợp Minutiae thông qua các phép biến đổi không gian (Translate & Rotate) và tính điểm tương đồng (Similarity Score).
-10. **Database System (`10_database_system.py`):** Hệ thống cơ sở dữ liệu SQLite mô phỏng ứng dụng thực tế với 2 pha: **Enrollment** (Đăng ký vân tay) và **Matching** (Nhận dạng người dùng).
-
----
-
-## Thư viện sử dụng
-
-Dự án phụ thuộc vào các thư viện Python sau:
-- `numpy`: Xử lý mảng và ma trận toán học.
-- `opencv-python` (`cv2`): Đọc, ghi và xử lý các phép toán trên ảnh cơ bản (Sobel, CLAHE, Thresholding...).
-- `matplotlib`: Trực quan hóa dữ liệu, vẽ biểu đồ và hiển thị kết quả các bước.
-- `scipy`: Xoay ảnh (rotate), tìm đỉnh sóng (maximum_filter1d) và tính toán khoảng cách Euclid.
-- `scikit-image` (`skimage`): Cung cấp thuật toán làm mảnh khung xương (`skeletonize`).
-
----
-
-## Cài đặt (Installation)
-
-**1. Clone repository:**
-```bash
-git clone <your-repo-url>
-cd <your-repo-folder>
+```text
+03_enhancement.py
+  -> 04_orientation_field.py
+  -> 05_frequency_estimation.py
+  -> 06_gabor_filter.py
+  -> 08_fingercode_extraction.py
+  -> 10_database_system.py / 11_gui.py / 12_evaluate_FAR_FRR.py / 13_eval_acc_recall_preci.py
 ```
 
-**2. Tạo môi trường ảo (Khuyến nghị):**
+Vai tro tung file Python con lai:
+
+| File | Vai tro |
+| --- | --- |
+| `config.py` | Cau hinh duong dan dataset, DB, FAISS index, output va so ket qua top-k. |
+| `03_enhancement.py` | Chuan hoa anh, tach vung van tay va tang cuong tuong phan bang CLAHE. |
+| `04_orientation_field.py` | Uoc luong huong duong van bang Sobel, covariance va doubled-angle smoothing. |
+| `05_frequency_estimation.py` | Uoc luong tan so/buoc song duong van theo tung block. |
+| `06_gabor_filter.py` | Tao kernel Gabor theo huong va tan so de `08` trich Fingercode. |
+| `08_fingercode_extraction.py` | Tao vector Fingercode 320 chieu tu anh van tay. |
+| `10_database_system.py` | Build lai `fingerprint.db` va `faiss_ivf.index` tu 300 nguoi dau, moi nguoi 10 ngon = 3000 anh. |
+| `11_gui.py` | GUI tim kiem anh truy van va hien thi top-5 anh gan nhat. |
+| `12_evaluate_FAR_FRR.py` | Danh gia Genuine/Impostor, FAR, FRR, ROC, EER. |
+| `13_eval_acc_recall_preci.py` | Danh gia Top-1, Top-5 accuracy, macro precision va macro recall. |
+
+## File da loai bo
+
+Cac file sau la script hoc thu/demo doc lap, khong nam trong luong san pham hien tai:
+
+| File | Ly do loai bo |
+| --- | --- |
+| `01_visualize_fingerprint.py` | Chi ve anh va histogram, khong duoc import boi DB, GUI hay evaluation. |
+| `02_preprocessing.py` | Trung chuc nang voi `normalize_image` va `segment_fingerprint` trong `03_enhancement.py`. |
+| `09_matching.py` | Demo so khop 1-vs-1 rieng le, khong phai luong top-5 qua SQLite + FAISS. |
+| `Day1_Concepts.md`, `Day2_Preprocessing.md` | Ghi chu hoc tap cho `01/02`, khong con dung sau khi loai cac demo do. |
+
+## Cai dat
 
 ```bash
-# Active môi trường
 python -m venv venv
-
-#trước mỗi lần chạy, cần activate môi trường ảo như sau:
-# Windows:
-venv\Scripts\activate
-# macOS/Linux:
 source venv/bin/activate
-```
-
-**3. Cài đặt các thư viện yêu cầu:**
-
-```bash
 pip install -r requirements.txt
 ```
-**4. Cấu trúc Thư mục & Dữ liệu**
 
-Mã nguồn được thiết lập để đọc dữ liệu vân tay từ dataset FVC2002 (DB1_B). Bạn cần sắp xếp thư mục theo đúng cấu trúc sau để code không bị lỗi đường dẫn:
+Dataset duoc cau hinh mac dinh o:
 
-```bash
-Workspace/
-│
-├── FVC2002/
-│   └── DB1_B/
-│       ├── 101_1.tif
-│       ├── 101_2.tif
-│       └── ... (Các ảnh vân tay khác)
-│
-└── Python_Implement_FingerPrint_Project/    <-- (Thư mục Repo của bạn)
-    ├── .gitignore
-    ├── 01_visualize_fingerprint.py
-    ├── 02_preprocessing.py
-    ├── ...
-    ├── 10_database_system.py
-    └── requirements.txt
-```
-(Code sử dụng os.path.join(BASE_DIR, "..", "FVC2002", "DB1_B") để tìm ảnh).
-
-**5. Cách sử dụng (Usage)**
-
-Bạn có thể chạy độc lập từng script để xem kết quả của từng bước. Kết quả (các biểu đồ, hình ảnh so sánh) sẽ được tự động lưu vào thư mục output/ nằm trong project.
-
-Chạy để hiểu quy trình (Từ bước 1 đến 9):
-
-```bash
-python 01_visualize_fingerprint.py
-python 03_enhancement.py
-...
-python 09_matching.py
+```text
+SOCOFing/Real
+SOCOFing/Altered/Altered-Easy
 ```
 
-Chạy hệ thống hoàn chỉnh (Bước 10):
+Neu can doi dataset, sua `DATASET_PATH` trong `config.py`.
+
+## Cach chay
+
+Build lai database va FAISS index:
 
 ```bash
 python 10_database_system.py
 ```
-Khi chạy script số 10, hệ thống sẽ tự động tạo file fingerprint.db (SQLite), đăng ký một số dữ liệu mẫu giả lập và thực hiện truy vấn so khớp để in kết quả ra Terminal.
 
-**6. Cấu trúc Cơ sở dữ liệu**
+Chay GUI tim top-5:
 
-Hệ thống ở bước 10 sử dụng SQLite với cấu trúc tối ưu:
+```bash
+python 11_gui.py
+```
 
-Bảng Users: Chứa thông tin định danh (Tên, Chức vụ...).
+Chay danh gia FAR/FRR/EER:
 
-Bảng Fingerprint_Templates:
+```bash
+python 12_evaluate_FAR_FRR.py
+```
 
-Liên kết với Users qua Khóa ngoại (user_id).
+Chay danh gia Top-1/Top-5, precision, recall:
 
-Lưu trữ các Minutiae đã trích xuất dưới dạng chuỗi JSON ([{"x": 120, "y": 95, "type": 1, "angle": 1.57}, ...]) giúp tối ưu hóa dung lượng thay vì lưu ảnh gốc.
+```bash
+python 13_eval_acc_recall_preci.py
+```
 
-Khi có truy vấn nhận dạng, hệ thống gọi dữ liệu từ DB, parse JSON thành mảng NumPy và tính toán Matching Score.
+## Du lieu sinh ra
+
+| File/thu muc | Noi dung |
+| --- | --- |
+| `fingerprint.db` | SQLite DB luu metadata va vector Fingercode. |
+| `faiss_ivf.index` | FAISS IVF index dung de search top-k. |
+| `output/` | Anh va bao cao danh gia sinh ra tu cac script. |
+| `evaluation_results.*` | Ket qua danh gia tu `13_eval_acc_recall_preci.py`. |

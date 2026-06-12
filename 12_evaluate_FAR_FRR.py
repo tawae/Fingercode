@@ -16,7 +16,6 @@ Chiến lược tạo cặp:
 import os
 import re
 import glob
-import json
 import time
 import random
 import numpy as np
@@ -41,6 +40,24 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 from importlib.util import spec_from_file_location, module_from_spec
 
 def _import_module(name, filepath):
+    """
+    Mục đích:
+      Import module pipeline từ đường dẫn file.
+
+    Tham số:
+      name: Tên module tạm.
+      filepath: Đường dẫn tới file `.py`.
+
+    Vì sao chọn tham số này:
+      File `08_fingercode_extraction.py` bắt đầu bằng số nên cần import động.
+
+    Đầu ra:
+      Module object đã nạp.
+
+    Vì sao đầu ra như vậy mà không trả trực tiếp `extract_features`:
+      Helper giữ cách import nhất quán với các module khác; caller gán hàm cần
+      dùng ngay sau đó.
+    """
     spec = spec_from_file_location(name, filepath)
     mod = module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -55,7 +72,24 @@ extract_features = step08.extract_features
 # PARSE FILENAME
 # ============================================================================
 def parse_filename(filename):
-    """Parse SOCOFing filename → (person_id, gender, hand, finger)"""
+    """
+    Mục đích:
+      Parse tên file SOCOFing thành person, gender, hand và finger.
+
+    Tham số:
+      filename: Basename ảnh SOCOFing.
+
+    Vì sao chọn tham số này:
+      Cặp genuine/impostor được tạo dựa trên danh tính và ngón tay được mã hóa
+      trong filename, không cần metadata ngoài.
+
+    Đầu ra:
+      Tuple `(person_id, gender, hand, finger)`; trả toàn `None` nếu không khớp.
+
+    Vì sao đầu ra như vậy mà không raise lỗi:
+      Khi quét thư mục, có thể gặp file không đúng mẫu; bỏ qua an toàn tốt hơn
+      dừng toàn bộ đánh giá.
+    """
     m = re.match(r"(\d+)__([MF])_([A-Za-z]+)_([A-Za-z]+)_finger", filename)
     if m:
         return m.group(1), m.group(2), m.group(3), m.group(4)
@@ -67,9 +101,23 @@ def parse_filename(filename):
 # ============================================================================
 def build_pairs():
     """
-    Tạo danh sách cặp Genuine và Impostor.
-    Genuine: TOÀN BỘ cặp Real[person_X, finger_Y] vs Altered[person_X, finger_Y]
-    Impostor: Random cặp khác người, số lượng = số genuine (cân bằng thống kê)
+    Mục đích:
+      Tạo cặp genuine và impostor cho đánh giá FAR/FRR.
+
+    Tham số:
+      Không có tham số; dùng thư mục Real và Altered-Easy trong config/module.
+
+    Vì sao chọn không truyền tham số:
+      Script đánh giá có cấu hình dataset cố định để kết quả lặp lại được; giới
+      hạn 50 user đầu giúp thời gian chạy vừa phải.
+
+    Đầu ra:
+      Tuple `(genuine_pairs, impostor_pairs)`, mỗi phần là list tuple
+      `(real_path, altered_path, label)`.
+
+    Vì sao đầu ra như vậy mà không trả DataFrame:
+      Vòng tính score chỉ cần danh sách path đơn giản; list tuple nhẹ hơn và
+      không thêm phụ thuộc pandas.
     """
     print("Đang quét thư mục Real và Altered-Easy...")
 
@@ -128,7 +176,25 @@ def build_pairs():
 # TÍNH SCORE CHO CÁC CẶP
 # ============================================================================
 def compute_scores(pairs, label):
-    """Trích xuất Fingercode + tính similarity L2 (cùng công thức với DB search_top_k)."""
+    """
+    Mục đích:
+      Trích Fingercode cho từng cặp ảnh và tính similarity dựa trên L2 distance.
+
+    Tham số:
+      pairs: List tuple `(real_path, altered_path, label)`.
+      label: Tên nhóm dùng cho progress bar/log.
+
+    Vì sao chọn tham số này:
+      `pairs` tách rõ dữ liệu đánh giá khỏi logic tính điểm; `label` giúp log
+      phân biệt Genuine và Impostor khi chạy lâu.
+
+    Đầu ra:
+      Numpy array chứa similarity score `1 / (1 + L2)`.
+
+    Vì sao đầu ra như vậy mà không trả distance:
+      FAR/FRR thường quét threshold theo chiều score càng cao càng giống, đồng
+      nhất với similarity trong `search_top_k`.
+    """
     scores = []
     errors = 0
 
@@ -159,8 +225,24 @@ def compute_scores(pairs, label):
 # ============================================================================
 def compute_far_frr(genuine_scores, impostor_scores, thresholds):
     """
-    FAR(t) = Tỷ lệ impostor bị chấp nhận nhầm (score > t)
-    FRR(t) = Tỷ lệ genuine bị từ chối nhầm (score <= t)
+    Mục đích:
+      Tính FAR và FRR tại từng threshold.
+
+    Tham số:
+      genuine_scores: Scores của các cặp cùng người/cùng ngón.
+      impostor_scores: Scores của các cặp khác người.
+      thresholds: Mảng ngưỡng cần quét.
+
+    Vì sao chọn tham số này:
+      FAR cần impostor score, FRR cần genuine score, và threshold tách riêng để
+      có thể dùng độ phân giải bất kỳ khi vẽ ROC/EER.
+
+    Đầu ra:
+      Tuple `(far_array, frr_array)` cùng chiều với `thresholds`.
+
+    Vì sao đầu ra như vậy mà không trả một dict:
+      Các hàm `find_eer` và `plot_evaluation` thao tác vector numpy trực tiếp,
+      nên tuple array gọn và nhanh hơn.
     """
     far_list = []
     frr_list = []
@@ -175,7 +257,24 @@ def compute_far_frr(genuine_scores, impostor_scores, thresholds):
 
 
 def find_eer(far, frr, thresholds):
-    """Tìm EER: điểm giao giữa FAR và FRR."""
+    """
+    Mục đích:
+      Tìm Equal Error Rate, điểm FAR và FRR gần nhau nhất.
+
+    Tham số:
+      far: Mảng FAR theo threshold.
+      frr: Mảng FRR theo threshold.
+      thresholds: Mảng threshold tương ứng.
+
+    Vì sao chọn tham số này:
+      EER được suy ra từ ba mảng đã tính sẵn, tránh tính lại scores.
+
+    Đầu ra:
+      Tuple `(eer, eer_threshold)`.
+
+    Vì sao đầu ra như vậy mà không trả index:
+      Báo cáo cần giá trị EER và threshold thực tế; index chỉ là chi tiết nội bộ.
+    """
     diff = np.abs(far - frr)
     idx = np.argmin(diff)
     eer = (far[idx] + frr[idx]) / 2
@@ -186,7 +285,30 @@ def find_eer(far, frr, thresholds):
 # VẼ BIỂU ĐỒ
 # ============================================================================
 def plot_evaluation(genuine_scores, impostor_scores, far, frr, thresholds, eer, eer_threshold):
-    """Vẽ 4 biểu đồ đánh giá và lưu file."""
+    """
+    Mục đích:
+      Vẽ phân bố score, FAR/FRR, ROC và summary text rồi lưu thành ảnh báo cáo.
+
+    Tham số:
+      genuine_scores: Scores genuine.
+      impostor_scores: Scores impostor.
+      far: Mảng FAR.
+      frr: Mảng FRR.
+      thresholds: Mảng threshold.
+      eer: Giá trị Equal Error Rate.
+      eer_threshold: Threshold tại EER.
+
+    Vì sao chọn tham số này:
+      Hàm vẽ không tự tính metrics để tách phần tính toán và phần trình bày, giúp
+      dễ kiểm tra từng bước.
+
+    Đầu ra:
+      Giá trị `auc` của ROC.
+
+    Vì sao đầu ra như vậy mà không trả figure:
+      Figure đã được lưu và đóng trong hàm; AUC là chỉ số còn cần cho báo cáo
+      text ở `save_report`.
+    """
     fig, axes = plt.subplots(2, 2, figsize=(14, 11))
     fig.suptitle("Fingerprint System Evaluation Report", fontsize=16, fontweight='bold')
 
@@ -268,7 +390,31 @@ def plot_evaluation(genuine_scores, impostor_scores, far, frr, thresholds, eer, 
 # LƯU KẾT QUẢ ĐÁNH GIÁ RA FILE TXT
 # ============================================================================
 def save_report(genuine_scores, impostor_scores, far, frr, thresholds, eer, eer_threshold, auc):
-    """Lưu báo cáo đánh giá chi tiết ra file text."""
+    """
+    Mục đích:
+      Lưu báo cáo FAR/FRR/EER chi tiết ra file text.
+
+    Tham số:
+      genuine_scores: Scores genuine.
+      impostor_scores: Scores impostor.
+      far: Mảng FAR.
+      frr: Mảng FRR.
+      thresholds: Mảng threshold.
+      eer: Equal Error Rate.
+      eer_threshold: Threshold tại EER.
+      auc: Diện tích dưới ROC.
+
+    Vì sao chọn tham số này:
+      Báo cáo cần cả score thô, curve đã tính và chỉ số tổng hợp; truyền vào
+      tránh phụ thuộc biến global.
+
+    Đầu ra:
+      Không return; ghi file `output/12_evaluation_results.txt`.
+
+    Vì sao đầu ra như vậy mà không trả chuỗi report:
+      Kết quả đánh giá cần lưu để nộp/xem lại. In hoặc trả chuỗi dài không thuận
+      tiện bằng file text.
+    """
     report_path = os.path.join(OUTPUT_DIR, "12_evaluation_results.txt")
 
     with open(report_path, "w", encoding="utf-8") as f:
@@ -280,7 +426,7 @@ def save_report(genuine_scores, impostor_scores, far, frr, thresholds, eer, eer_
         f.write("1. CẤU HÌNH ĐÁNH GIÁ\n")
         f.write(f"   Gallery     : Real images (SOCOFing)\n")
         f.write(f"   Probe       : Altered-Easy (biến thể _CR)\n")
-        f.write(f"   Matching    : KD-Tree + Poincare alignment\n")
+        f.write(f"   Matching    : Fingercode + L2 similarity\n")
         f.write(f"   Genuine Pairs : {len(genuine_scores)}\n")
         f.write(f"   Impostor Pairs: {len(impostor_scores)}\n\n")
 

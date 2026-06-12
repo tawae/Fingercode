@@ -16,9 +16,7 @@ Thuật toán Fingercode:
 
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import os
-import math
 
 # ============================================================================
 # CẤU HÌNH
@@ -26,9 +24,6 @@ import math
 import config
 
 BASE_DIR = config.BASE_DIR
-DATASET_PATH = config.DATASET_PATH
-SAMPLE_IMAGE = "101_1.tif"
-OUTPUT_DIR = config.OUTPUT_DIR
 
 # Thông số Fingercode
 NUM_BANDS = 5
@@ -40,6 +35,24 @@ FINGERCODE_DIM = NUM_BANDS * NUM_SECTORS_PER_BAND * len(GABOR_ANGLES)
 
 from importlib.util import spec_from_file_location, module_from_spec
 def _import_module(name, filepath):
+    """
+    Mục đích:
+      Import module pipeline từ file path.
+
+    Tham số:
+      name: Tên module tạm.
+      filepath: Đường dẫn tới file `.py`.
+
+    Vì sao chọn tham số này:
+      Dự án giữ tên file dạng đánh số nên cần import động thay vì import chuẩn.
+
+    Đầu ra:
+      Module object đã nạp.
+
+    Vì sao đầu ra như vậy mà không trả từng hàm:
+      `08` cần nhiều dependency từ `03-06`; trả module giúp code rõ nguồn gốc
+      từng hàm (`step03`, `step04`, ...).
+    """
     spec = spec_from_file_location(name, filepath)
     mod = module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -55,9 +68,25 @@ step06 = _import_module("s06", os.path.join(BASE_DIR, "06_gabor_filter.py"))
 # ============================================================================
 def find_core_point(orient_img, mask):
     """
-    Tìm điểm Core (điểm trung tâm) dựa vào sự biến thiên góc hướng 
-    (Orientation Variance). Nơi giao nhau của nhiều hướng (vùng lõi vân tay)
-    thường có sự biến thiên góc hướng cao nhất.
+    Mục đích:
+      Tìm core point, tức tâm tương đối của vùng vân tay, dựa trên biến thiên
+      orientation cục bộ.
+
+    Tham số:
+      orient_img: Bản đồ hướng radian từ `estimate_orientation`.
+      mask: Mask vùng vân tay, dùng để bỏ nền và vùng biên.
+
+    Vì sao chọn tham số này:
+      Fingercode cần một tâm để chia ROI thành các band/sector. Orientation
+      variance thường cao quanh vùng lõi, còn mask tránh chọn nhầm nền hoặc mép
+      ảnh nơi hướng không ổn định.
+
+    Đầu ra:
+      Tuple `(core_r, core_c)` là tọa độ hàng/cột của core point.
+
+    Vì sao đầu ra như vậy mà không trả cả variance map:
+      Pipeline chính chỉ cần tọa độ tâm để trích vector. Variance map là dữ liệu
+      trung gian lớn, không cần lưu nếu không vẽ debug.
     """
     rows, cols = orient_img.shape
     variance_map = np.zeros_like(orient_img)
@@ -113,8 +142,31 @@ def extract_fingercode(img, core_r, core_c, median_freq, num_bands=NUM_BANDS,
                        num_sectors=NUM_SECTORS_PER_BAND, inner_radius=INNER_RADIUS, 
                        band_width=BAND_WIDTH):
     """
-    Áp dụng 8 bộ lọc Gabor theo cấu trúc Jain's Fingercode và trích 
-    xuất đặc trưng phương sai từ các sector.
+    Mục đích:
+      Trích vector Fingercode bằng cách chia ROI quanh core thành các sector,
+      lọc ảnh bằng 8 hướng Gabor và lấy AAD trên từng sector.
+
+    Tham số:
+      img: Ảnh grayscale đã enhancement.
+      core_r: Tọa độ hàng của core point.
+      core_c: Tọa độ cột của core point.
+      median_freq: Tần số ridge đại diện để tạo Gabor kernels.
+      num_bands: Số vòng đồng tâm quanh core.
+      num_sectors: Số sector trên mỗi vòng.
+      inner_radius: Bán kính bỏ qua vùng lõi trong cùng.
+      band_width: Độ rộng mỗi band.
+
+    Vì sao chọn tham số này:
+      Cấu hình mặc định `5 bands * 8 sectors * 8 hướng Gabor` tạo vector 320
+      chiều, đủ cố định cho FAISS. `inner_radius` tránh vùng core quá cong và
+      nhiễu; `band_width=20` giữ mỗi sector có đủ pixel để thống kê ổn định.
+
+    Đầu ra:
+      Tuple `(feature_vector, sector_map)`.
+
+    Vì sao đầu ra như vậy mà không trả danh sách feature thô:
+      `feature_vector` được chuẩn hóa L2 để so khoảng cách ổn định trong FAISS.
+      `sector_map` được trả kèm để có thể debug/visualize cách chia ROI nếu cần.
     """
     rows, cols = img.shape
     feature_vector = []
@@ -186,8 +238,24 @@ def extract_fingercode(img, core_r, core_c, median_freq, num_bands=NUM_BANDS,
 # ============================================================================
 def extract_features(img_path):
     """
-    Hàm thay thế extract_features() trả về feature_vector có độ dài cố định.
-    Dùng cho: database_system và matching.
+    Mục đích:
+      Entry point trích đặc trưng cho toàn hệ thống: đọc ảnh, enhancement,
+      orientation, frequency, tìm core và tạo Fingercode.
+
+    Tham số:
+      img_path: Đường dẫn ảnh vân tay cần xử lý.
+
+    Vì sao chọn tham số này:
+      DB, GUI và evaluation đều bắt đầu từ file ảnh trên đĩa, nên nhận path giúp
+      các tầng gọi không phải lặp lại logic đọc ảnh và xử lý lỗi định dạng.
+
+    Đầu ra:
+      Tuple `(feature_vector, img)`; nếu đọc ảnh lỗi thì trả `(None, None)`.
+
+    Vì sao đầu ra như vậy mà không chỉ trả vector:
+      Vector dùng cho matching/FAISS, còn ảnh gốc dùng để hiển thị query trong
+      GUI và báo cáo demo. Trả `None` thay exception giúp batch enrollment và
+      evaluation bỏ qua ảnh lỗi an toàn.
     """
     img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -214,25 +282,3 @@ def extract_features(img_path):
     feature_vector, _ = extract_fingercode(enhanced, core_r, core_c, median_freq)
 
     return feature_vector, img
-
-
-def process_fingercode():
-    img_path = os.path.join(DATASET_PATH, SAMPLE_IMAGE)
-    if not os.path.exists(img_path):
-        print(f"Lỗi: Không tìm thấy ảnh tại {img_path}")
-        return
-
-    vector, img = extract_features(img_path)
-    
-    print("\n" + "=" * 60)
-    print("KẾT QUẢ RÚT ĐẶC TRƯNG FINGERCODE JAIN")
-    print("=" * 60)
-    if vector is not None:
-        print(f"Thành công! Vector Fingercode có độ dài: {len(vector)} (chiều).")
-        print(f"Một số giá trị đầu: {vector[:10]}")
-    else:
-        print("Lỗi trong quá trình trích xuất.")
-
-
-if __name__ == "__main__":
-    process_fingercode()

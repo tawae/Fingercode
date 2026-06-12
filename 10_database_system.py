@@ -9,17 +9,15 @@ Mục tiêu:
   4. Thêm các trường `user_id`, `sex`, `finger_index` trích xuất từ tên ảnh.
      Định dạng tên ảnh: <user_id>__<sex>_<hand>_<finger_type>_finger.BMP
      Ví dụ: 1__M_Left_index_finger.BMP  ->  user_id=1, sex=M, finger_index=Left_index
-  5. Chỉ nạp 3000 ảnh đầu tiên với user_id từ 1 đến 3000.
+  5. Chỉ nạp 300 người đầu tiên, mỗi người 10 ảnh, tương đương 3000 ảnh.
 """
 
 import sqlite3
 import json
 import numpy as np
-import cv2
 import os
 import faiss
 import time
-import matplotlib.pyplot as plt
 
 # ============================================================================
 # CẤU HÌNH
@@ -29,10 +27,8 @@ import config
 BASE_DIR = config.BASE_DIR
 DATASET_PATH = config.DATASET_PATH
 DB_PATH = config.DB_PATH
-OUTPUT_DIR = config.OUTPUT_DIR
 FAISS_INDEX_PATH = config.FAISS_INDEX_PATH
 TARGET_KNN = config.TARGET_KNN
-FAISS_DIM = config.FAISS_DIM
 
 # ============================================================================
 # IMPORT TỪ BƯỚC FEATURE EXTRACTION (08)
@@ -40,6 +36,25 @@ FAISS_DIM = config.FAISS_DIM
 from importlib.util import spec_from_file_location, module_from_spec
 
 def _import_module(name, filepath):
+    """
+    Mục đích:
+      Import module từ đường dẫn file cụ thể.
+
+    Tham số:
+      name: Tên tạm của module.
+      filepath: Đường dẫn tới file `.py`.
+
+    Vì sao chọn tham số này:
+      File pipeline bắt đầu bằng số nên không import chuẩn được; import động cho
+      phép giữ tên file theo thứ tự bước xử lý.
+
+    Đầu ra:
+      Module object đã nạp.
+
+    Vì sao đầu ra như vậy mà không trả trực tiếp `extract_features`:
+      Trả module giữ helper tổng quát, sau đó file này gán rõ
+      `extract_features = step08.extract_features`.
+    """
     spec = spec_from_file_location(name, filepath)
     mod = module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -53,10 +68,24 @@ extract_features = step08.extract_features
 # ============================================================================
 def parse_filename(filename):
     """
-    Trích xuất user_id, sex, finger_index từ tên file ảnh.
-    Định dạng: <user_id>__<sex>_<hand>_<finger_type>_finger[.ext]
-    Ví dụ: '1__M_Left_index_finger.BMP'  ->  (1, 'M', 'Left_index')
-    Trả về (None, None, None) nếu không parse được.
+    Mục đích:
+      Trích metadata SOCOFing từ tên file ảnh.
+
+    Tham số:
+      filename: Tên file hoặc basename theo dạng
+      `<user_id>__<sex>_<hand>_<finger_type>_finger[.ext]`.
+
+    Vì sao chọn tham số này:
+      SOCOFing đã mã hóa user, giới tính và ngón tay ngay trong filename, nên
+      không cần đọc thêm file nhãn riêng.
+
+    Đầu ra:
+      Tuple `(user_id, sex, finger_index)`; trả `(None, None, None)` nếu tên
+      file không đúng format.
+
+    Vì sao đầu ra như vậy mà không raise lỗi:
+      Batch enrollment cần bỏ qua file lạ mà không dừng toàn bộ quá trình nạp
+      3000 ảnh.
     """
     # Bỏ phần mở rộng file
     name = os.path.splitext(filename)[0]   # '1__M_Left_index_finger'
@@ -89,13 +118,53 @@ def parse_filename(filename):
 # DATABSE MANAGER QUẢN LÝ SQLITE + FAISS
 # ============================================================================
 class FingerprintVectorDB:
+    """
+    Quản lý đồng thời SQLite metadata/vector và FAISS IVF index.
+    """
+
     def __init__(self, db_path):
+        """
+        Mục đích:
+          Khởi tạo đối tượng quản lý DB nhưng chưa mở kết nối.
+
+        Tham số:
+          db_path: Đường dẫn file SQLite.
+
+        Vì sao chọn tham số này:
+          Cho phép GUI/evaluation/test truyền cùng hoặc khác DB path mà không
+          phụ thuộc biến global cứng.
+
+        Đầu ra:
+          Không return; thiết lập trạng thái ban đầu của instance.
+
+        Vì sao đầu ra như vậy mà không tự connect ngay:
+          Tách constructor và `connect` giúp caller kiểm soát thời điểm mở file
+          DB/FAISS, thuận tiện cho GUI và script batch.
+        """
         self.db_path = db_path
         self.conn = None
         self.cursor = None
         self.index = None
     
     def connect(self):
+        """
+        Mục đích:
+          Mở kết nối SQLite, tạo bảng nếu thiếu và nạp/tạo FAISS index.
+
+        Tham số:
+          Không có tham số; dùng `self.db_path` đã truyền khi khởi tạo.
+
+        Vì sao chọn không truyền tham số:
+          Đường dẫn DB là cấu hình cố định của instance, tránh truyền lặp lại ở
+          mọi lời gọi.
+
+        Đầu ra:
+          Không return; cập nhật `self.conn`, `self.cursor`, `self.index`.
+
+        Vì sao đầu ra như vậy mà không trả connection:
+          Các thao tác DB/FAISS được đóng gói trong class để GUI chỉ gọi các
+          method nghiệp vụ như `search_top_k`.
+        """
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
@@ -105,13 +174,45 @@ class FingerprintVectorDB:
         self._load_or_create_index()
 
     def close(self):
+        """
+        Mục đích:
+          Đóng kết nối SQLite khi kết thúc batch hoặc GUI.
+
+        Tham số:
+          Không có tham số; dùng connection đang giữ trong instance.
+
+        Vì sao chọn không truyền tham số:
+          Connection thuộc sở hữu của object, caller không cần biết chi tiết.
+
+        Đầu ra:
+          Không return.
+
+        Vì sao đầu ra như vậy mà không trả trạng thái:
+          Đóng DB là thao tác cleanup; nếu có lỗi nghiêm trọng SQLite sẽ raise
+          exception, còn trạng thái thành công không cần dùng tiếp.
+        """
         if self.conn:
             self.conn.close()
             print("  Đã đóng kết nối database.")
 
     def _init_tables(self):
-        """Đảm bảo bảng Fingerprints tồn tại. KHÔNG xóa dữ liệu cũ.
-        Việc reset DB được xử lý bởi os.remove(DB_PATH) trong main() trước khi connect().
+        """
+        Mục đích:
+          Đảm bảo schema SQLite hiện tại tồn tại và dọn các bảng legacy cũ.
+
+        Tham số:
+          Không có tham số; dùng `self.cursor` của kết nối hiện tại.
+
+        Vì sao chọn không truyền tham số:
+          Đây là helper nội bộ, luôn thao tác trên DB mà instance đang quản lý.
+
+        Đầu ra:
+          Không return; commit schema vào SQLite.
+
+        Vì sao đầu ra như vậy mà không trả SQL/schema:
+          Caller chỉ cần DB sẵn sàng. Việc reset dữ liệu được làm ở `main` bằng
+          cách xóa file DB trước khi connect, nên helper này không drop bảng
+          `Fingerprints` để tránh mất dữ liệu khi GUI mở DB có sẵn.
         """
         # Dọn các bảng schema cũ (legacy) nếu còn sót
         self.cursor.execute("DROP TABLE IF EXISTS Fingerprint_Templates")
@@ -133,7 +234,24 @@ class FingerprintVectorDB:
         self.conn.commit()
 
     def _load_or_create_index(self):
-        """Khởi tạo FAISS Index. Nạp từ đĩa nếu có."""
+        """
+        Mục đích:
+          Nạp FAISS index từ đĩa nếu tồn tại, hoặc đánh dấu chưa có index.
+
+        Tham số:
+          Không có tham số; dùng `FAISS_INDEX_PATH` trong config.
+
+        Vì sao chọn không truyền tham số:
+          Hệ thống chỉ dùng một index đồng bộ với DB hiện tại, nên path đặt ở
+          config chung.
+
+        Đầu ra:
+          Không return; cập nhật `self.index`.
+
+        Vì sao đầu ra như vậy mà không tạo index rỗng ngay:
+          IVF index cần train trên vector thật trước khi add dữ liệu; tạo rỗng
+          sớm sẽ không dùng được cho search.
+        """
         if os.path.exists(FAISS_INDEX_PATH):
             self.index = faiss.read_index(FAISS_INDEX_PATH)
             print(f"  Đã load FAISS Index từ {FAISS_INDEX_PATH} (Tổng vector: {self.index.ntotal})")
@@ -146,8 +264,24 @@ class FingerprintVectorDB:
     # ────────────────────────────────────────────────────────────────────
     def batch_enroll_and_build(self, feature_data_list):
         """
-        Nạp một danh sách các tuple [(source_image, user_id, sex, finger_index, feature_vector), ...]
-        Xây dựng Index IVF, lấy cluster ID và insert vào SQLite.
+        Mục đích:
+          Nạp batch vector Fingercode vào SQLite và build FAISS IndexIVFFlat.
+
+        Tham số:
+          feature_data_list: Danh sách tuple
+          `(source_image, user_id, sex, finger_index, feature_vector)`.
+
+        Vì sao chọn tham số này:
+          Enrollment tách extraction ra trước rồi build FAISS một lần theo batch;
+          cách này cần toàn bộ vector để train IVF ổn định và nhanh hơn add lẻ.
+
+        Đầu ra:
+          Không return; ghi records vào SQLite, ghi index FAISS ra đĩa và gán
+          `self.index`.
+
+        Vì sao đầu ra như vậy mà không trả danh sách kết quả:
+          ID/metadata đã nằm trong SQLite và FAISS index. Caller chỉ cần DB/index
+          sẵn sàng cho pha search.
         """
         num_vectors = len(feature_data_list)
         if num_vectors == 0:
@@ -203,7 +337,25 @@ class FingerprintVectorDB:
     # ────────────────────────────────────────────────────────────────────
     def search_top_k(self, query_vector, k=TARGET_KNN):
         """
-        Tìm K dấu vân tay gần nhất từ vector truy vấn.
+        Mục đích:
+          Tìm `k` vector gần nhất với vector truy vấn bằng FAISS IVF và trả
+          metadata từ SQLite.
+
+        Tham số:
+          query_vector: Vector Fingercode của ảnh truy vấn.
+          k: Số kết quả gần nhất cần trả về.
+
+        Vì sao chọn tham số này:
+          GUI cần top-5 mặc định nên `k=TARGET_KNN`. Vẫn cho phép truyền `k`
+          để evaluation hoặc thử nghiệm dùng số kết quả khác.
+
+        Đầu ra:
+          List dict, mỗi dict gồm id, user_id, sex, finger_index, source_image,
+          cluster_id, distance và similarity.
+
+        Vì sao đầu ra như vậy mà không chỉ trả FAISS ids:
+          GUI và báo cáo cần đường dẫn ảnh, metadata và điểm similarity để hiển
+          thị. FAISS chỉ trả id/khoảng cách nên phải join thêm từ SQLite.
         """
         if self.index is None or not self.index.is_trained:
             print("  Lỗi: FAISS Index chưa sẵn sàng!")
@@ -249,7 +401,23 @@ class FingerprintVectorDB:
         return results
 
     def get_all_records(self):
-        """Thống kê chi tiết Database"""
+        """
+        Mục đích:
+          Lấy toàn bộ metadata fingerprint trong SQLite để thống kê/kiểm tra.
+
+        Tham số:
+          Không có tham số; dùng DB hiện tại của instance.
+
+        Vì sao chọn không truyền tham số:
+          Đây là truy vấn cố định phục vụ kiểm tra sau enrollment.
+
+        Đầu ra:
+          List dict, mỗi dict là một dòng trong bảng `Fingerprints`.
+
+        Vì sao đầu ra như vậy mà không trả cursor:
+          List dict dễ in, debug và dùng trong báo cáo mà không phụ thuộc vòng
+          đời cursor SQLite.
+        """
         self.cursor.execute(
             "SELECT id, user_id, sex, finger_index, source_image, cluster_id, created_at "
             "FROM Fingerprints ORDER BY id"
@@ -257,9 +425,29 @@ class FingerprintVectorDB:
         return [dict(row) for row in self.cursor.fetchall()]
 
 # ============================================================================
-# CHƯƠNG TRÌNH CHÍNH TỔNG HỢP (ENROLL + MATCHING)
+# CHƯƠNG TRÌNH CHÍNH TỔNG HỢP (ENROLLMENT)
 # ============================================================================
 def main():
+    """
+    Mục đích:
+      Rebuild toàn bộ DB và FAISS index từ dataset SOCOFing Real.
+
+    Tham số:
+      Không có tham số; dùng cấu hình trong `config.py`.
+
+    Vì sao chọn không truyền tham số:
+      Đây là script vận hành pha enrollment chuẩn của project. Các đường dẫn và
+      số lượng ảnh cần nạp được quản lý tập trung trong config/code để tránh
+      nhầm khi chạy.
+
+    Đầu ra:
+      Không return; tạo/cập nhật `fingerprint.db`, `faiss_ivf.index` và in thống
+      kê bảng sau khi build.
+
+    Vì sao đầu ra như vậy mà không trả object DB:
+      Script chạy độc lập từ terminal. GUI và evaluation sẽ mở lại DB/index từ
+      file đã sinh, không dùng object trong tiến trình build.
+    """
     print("=" * 60)
     print("  HỆ THỐNG IVF VÀ ĐẶC TRƯNG CỐ ĐỊNH (FINGERCODE)")
     print("=" * 60)
@@ -298,6 +486,10 @@ def main():
 
     print(f"  Tìm thấy {len(all_files)} ảnh trong dataset.")
     print(f"  Sau khi lọc user_id 1-{MAX_USER_ID}: {len(filtered_files)} ảnh sẽ được nạp vào Database.")
+    if not filtered_files:
+        print("  Không có ảnh hợp lệ để nạp. Kiểm tra DATASET_PATH trong config.py.")
+        db.close()
+        return
     print(f"  Thứ tự nạp: user_id {filtered_files[0][1]} → {filtered_files[-1][1]}")
 
     extracted_data = []  # [(source_image, user_id, sex, finger_index, feature_vector), ...]
@@ -333,88 +525,8 @@ def main():
     if len(records) > 20:
         print(f"  ... (còn {len(records) - 20} dòng nữa)")
 
-    # == PHA 2: MATCHING (QUERY TÌM TOP-5) ==
-    print("\n" + "=" * 60)
-    print("  PHA 2: MATCHING (KNN-SEARCH BẰNG FAISS IVF)")
-    print("=" * 60)
-    
-    test_queries = [
-        ("101__M_Left_index_finger.BMP", "user_id=101, đã có trong DB"),
-        ("500__M_Right_thumb_finger.BMP", "user_id=500, đã có trong DB"),
-    ]
-    
-    all_query_results = []
-    for q_file, desc in test_queries:
-        print(f"\n{'─' * 50}")
-        print(f"  QUERY IMAGE: {q_file} ({desc})")
-        print(f"{'─' * 50}")
-        
-        q_path = os.path.join(DATASET_PATH, q_file)
-        if not os.path.exists(q_path):
-            print(f"  => [SKIP] Tệp {q_path} không tồn tại!")
-            continue
-            
-        t0 = time.time()
-        q_vec, q_img = extract_features(q_path)
-        t_ext = time.time() - t0
-        print(f"  [Time] Trích xuất vector: {t_ext*1000:.1f}ms")
-        
-        if q_vec is None:
-            continue
-            
-        # Gọi Search (Không dùng Loop O(N)!)
-        top_k_list = db.search_top_k(q_vec, k=TARGET_KNN)
-        
-        print(f"\n  > --- KẾT QUẢ TOP {TARGET_KNN} TƯƠNG ĐỒNG NHẤT --- <")
-        for i, item in enumerate(top_k_list, 1):
-            file_base = os.path.basename(item['source_image'])
-            print(f"    R {i}: {file_base:<40} | user_id={item['user_id']:<5}"
-                  f" sex={item['sex']} finger={item['finger_index']:<15}"
-                  f" | Sim: {item['similarity']:.4f} | L2: {item['distance']:.4f}"
-                  f" | Cluster: {item['cluster_id']}")
-
-        all_query_results.append({
-            "query": q_file,
-            "desc": desc,
-            "img": q_img,
-            "top_k": top_k_list
-        })
-        
     db.close()
-    
-    # == VISUALIZE KẾT QUẢ TƯƠNG ĐỒNG ==
-    if all_query_results:
-        print("\n  Tạo visualization báo cáo...")
-        n_queries = len(all_query_results)
-        fig, axes = plt.subplots(n_queries, TARGET_KNN + 1, figsize=(15, 3 * n_queries))
-        if n_queries == 1: axes = [axes]
-        
-        for i, qr in enumerate(all_query_results):
-            ax_q = axes[i][0]
-            ax_q.imshow(qr["img"], cmap="gray")
-            ax_q.set_title(f"Query: {qr['query']}\n(Input)")
-            ax_q.axis('off')
-            
-            for j in range(TARGET_KNN):
-                ax_res = axes[i][j+1]
-                if j < len(qr["top_k"]):
-                    match = qr["top_k"][j]
-                    res_img = cv2.imread(match["source_image"], cv2.IMREAD_GRAYSCALE)
-                    if res_img is not None:
-                        ax_res.imshow(res_img, cmap="gray")
-                        s_name = os.path.basename(match['source_image'])
-                        ax_res.set_title(
-                            f"#{j+1}: {s_name}\n"
-                            f"UserID={match['user_id']} | {match['sex']} | {match['finger_index']}\n"
-                            f"Sim: {match['similarity']:.3f} | Cluster: {match['cluster_id']}"
-                        )
-                ax_res.axis('off')
-                
-        plt.tight_layout()
-        path_res = os.path.join(OUTPUT_DIR, "10_database_ivf_results.png")
-        plt.savefig(path_res, dpi=200, bbox_inches='tight')
-        print(f"  Đã xuất đồ họa: {path_res}")
-        
+
     print("\n" + "=" * 60)
     print("   ★★★ HOÀN THIỆN XÂY DỰNG FINGERCODE + FAISS IVF ★★★")
     print("=" * 60)

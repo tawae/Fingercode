@@ -15,6 +15,27 @@ database_system = importlib.import_module("10_database_system")
 FingerprintVectorDB = database_system.FingerprintVectorDB
 
 def evaluate_system():
+    """
+    Mục đích:
+      Đánh giá hệ thống nhận dạng bằng tập Altered-Easy: query từng ảnh, lấy
+      top-5 từ FAISS và tính Top-1 accuracy, Top-5 accuracy, macro precision,
+      macro recall.
+
+    Tham số:
+      Không có tham số; dùng dataset, DB path và output mặc định trong project.
+
+    Vì sao chọn không truyền tham số:
+      Đây là script benchmark chuẩn của repo, cần cố định user_id 1-50 và DB đã
+      build để kết quả có thể so sánh giữa các lần chạy.
+
+    Đầu ra:
+      Không return; in metrics và lưu JSON/CSV/TXT kết quả đánh giá.
+
+    Vì sao đầu ra như vậy mà không trả metrics:
+      Mục tiêu là tạo artifact đánh giá có thể nộp/xem lại. Metrics vẫn được gom
+      vào dict nội bộ trước khi ghi file, nhưng script terminal không cần caller
+      nhận giá trị trả về.
+    """
     t_start = time.time()
     # Đường dẫn tới tập ảnh Altered-Easy (tuyệt đối)
     _base = os.path.dirname(os.path.abspath(__file__))
